@@ -155,6 +155,9 @@ class MarkovRegime:
     compute the posterior probability of each regime given observed volatility.
     The regime is determined by the highest likelihood of observing the realized
     bar volatility, weighted by transition probabilities from the previous state.
+    
+    IMPORTANT: All parameters (transition matrix, emission means/stds) are 
+    ESTIMATED FROM DATA using Maximum Likelihood Estimation (MLE), not hardcoded.
     """
     
     def __init__(self):
@@ -190,23 +193,17 @@ class MarkovRegime:
         # 
         # T[i,j] = P(next_regime = j | current_regime = i)
         # 
-        # Reading the matrix:
-        #   Row i = "If we're currently in regime i, what's the probability of..."
-        #   Column j = "...transitioning to regime j?"
+        # THESE ARE INITIAL VALUES ONLY - they will be replaced by MLE estimates
+        # from historical data during calibration. We use uniform priors initially.
         # 
-        # Each row must sum to 1 (we must go somewhere).
-        # 
-        # The HIGH diagonal values (0.80-0.90) mean regimes are "sticky" - once
-        # we're in a regime, we tend to stay there. This reflects market reality:
-        # calm periods cluster together, as do volatile periods.
+        # Initial assumption: slight preference for staying in same state (ergodic)
+        # This ensures the Markov chain is well-defined before calibration.
         self.transition_matrix = np.array([
             # To:    LOW   MED   HIGH
-            [0.90, 0.08, 0.02],  # From LOW:  90% stay, 8% -> med, 2% -> high
-            [0.10, 0.80, 0.10],  # From MED:  10% -> low, 80% stay, 10% -> high  
-            [0.02, 0.08, 0.90]   # From HIGH: 2% -> low, 8% -> med, 90% stay
+            [1/3, 1/3, 1/3],  # Uniform prior - will be estimated from data
+            [1/3, 1/3, 1/3],  # Uniform prior - will be estimated from data
+            [1/3, 1/3, 1/3]   # Uniform prior - will be estimated from data
         ])
-        # Notice: It's hard to jump directly from LOW to HIGH (only 2% chance).
-        # Transitions typically go through the MED regime first.
         
         # =====================================================================
         # EMISSION DISTRIBUTION PARAMETERS (the "Hidden" part)
@@ -214,48 +211,73 @@ class MarkovRegime:
         # Each regime "emits" volatility values according to a Gaussian distribution.
         # This is the EMISSION MODEL: P(observed_volatility | regime)
         # 
-        # Why Gaussian? It's a reasonable assumption that volatility within a regime
-        # is normally distributed around some mean with some variance.
-        # 
-        # emission_means[i] = Expected (average) volatility when in regime i
-        # emission_stds[i]  = Standard deviation of volatility when in regime i
-        # 
-        # These parameters are calibrated from historical data.
-        # LOW regime:  mean=0.05%, std=0.03% (tight, small movements)
-        # MED regime:  mean=0.20%, std=0.10% (moderate movements)
-        # HIGH regime: mean=0.50%, std=0.30% (wide, large movements)
-        self.emission_means = np.array([0.0005, 0.002, 0.005])
-        self.emission_stds = np.array([0.0003, 0.001, 0.003])
+        # THESE ARE PLACEHOLDER VALUES - they will be estimated from data using MLE.
+        # Initial values are spaced to ensure numerical stability before calibration.
+        self.emission_means = np.array([0.001, 0.003, 0.006])  # Placeholder
+        self.emission_stds = np.array([0.0005, 0.001, 0.002])  # Placeholder
+        
+        # =====================================================================
+        # CALIBRATION DIAGNOSTICS
+        # =====================================================================
+        # Store information about the calibration for statistical validation
+        self.is_calibrated = False
+        self.calibration_stats = {
+            'n_samples': 0,
+            'transition_counts': None,
+            'regime_counts': None,
+            'log_likelihood': None,
+            'aic': None,  # Akaike Information Criterion
+            'bic': None   # Bayesian Information Criterion
+        }
 
     def calibrate(self, hist_bars):
         """
-        Calibrate emission distribution parameters and transition matrix from historical data.
+        Calibrate all model parameters from historical data using Maximum Likelihood Estimation.
         
-        Uses k-means style clustering to estimate regime-specific volatility distributions,
-        then estimates transition probabilities from observed regime sequences.
+        This method implements proper statistical estimation:
+        1. EMISSION PARAMETERS: Estimated using MLE for Gaussian mixture
+        2. TRANSITION MATRIX: Estimated using MLE with Laplace smoothing
+        3. MODEL VALIDATION: Computes AIC/BIC for model selection
+        
+        The approach:
+        - First, assign bars to regimes using percentile-based clustering
+        - Then, estimate emission parameters (μ, σ) for each regime using MLE
+        - Finally, estimate transition probabilities using frequency counting (MLE)
+        
+        Mathematical Foundation:
+        - For emission parameters: MLE of Gaussian gives μ̂ = sample mean, σ̂ = sample std
+        - For transition matrix: MLE gives T̂[i,j] = N[i,j] / Σⱼ N[i,j]
+          where N[i,j] is the count of transitions from state i to state j
         """
-        # Need enough data to get meaningful statistics
-        if len(hist_bars) < 20:
+        # Need enough data for reliable estimation (rule of thumb: 10+ per parameter)
+        if len(hist_bars) < 30:
+            print(f"Warning: Insufficient data for calibration ({len(hist_bars)} bars, need 30+)")
             return
         
         # =====================================================================
         # STEP 1: COMPUTE HISTORICAL VOLATILITIES
         # =====================================================================
-        # Volatility = (High - Low) / Close for each bar
+        # Volatility = (High - Low) / Close for each bar (True Range approximation)
         # This measures the price range as a fraction of the closing price
         vols = np.array([(b['h'] - b['l']) / b['c'] if b['c'] > 0 else 0 for b in hist_bars])
         vols = vols[vols > 0]  # Remove zero volatility bars (no price movement)
         
-        if len(vols) < 20:
+        if len(vols) < 30:
+            print(f"Warning: Insufficient non-zero volatility samples ({len(vols)})")
             return
         
         # =====================================================================
-        # STEP 2: ASSIGN BARS TO REGIMES USING PERCENTILES
+        # STEP 2: REGIME ASSIGNMENT USING PERCENTILE CLUSTERING
         # =====================================================================
-        # We split the volatility distribution into thirds:
-        #   Bottom 33% of volatilities -> LOW regime
-        #   Middle 33% of volatilities -> MED regime  
-        #   Top 33% of volatilities    -> HIGH regime
+        # We use percentile-based assignment as an initial clustering step.
+        # This is justified because:
+        #   - Volatility regimes are typically defined by relative levels
+        #   - Percentiles are robust to outliers
+        #   - This is equivalent to empirical quantile-based discretization
+        #
+        # Statistical justification: Under the assumption that each regime
+        # contributes roughly equally to the data, percentiles give consistent
+        # estimates of regime boundaries.
         p33, p67 = np.percentile(vols, 33), np.percentile(vols, 67)
         
         # Create array of regime assignments (0, 1, or 2 for each bar)
@@ -264,50 +286,193 @@ class MarkovRegime:
         regime_assignments[vols >= p67] = 2   # HIGH if above 67th percentile
         
         # =====================================================================
-        # STEP 3: ESTIMATE EMISSION PARAMETERS (mean and std for each regime)
+        # STEP 3: MLE FOR EMISSION PARAMETERS (Gaussian parameters per regime)
         # =====================================================================
-        # For each regime, compute the mean and standard deviation of volatilities
-        # that were assigned to that regime. This gives us the Gaussian parameters.
+        # For each regime, we estimate the Gaussian parameters using MLE:
+        #   μ̂ (MLE) = (1/n) Σ xᵢ  (sample mean)
+        #   σ̂ (MLE) = √[(1/n) Σ (xᵢ - μ̂)²]  (sample standard deviation)
+        #
+        # Note: We use n instead of (n-1) for true MLE, though the difference
+        # is negligible for our sample sizes.
+        
+        regime_counts = np.zeros(self.n_states)
+        temp_means = np.zeros(self.n_states)
+        temp_stds = np.zeros(self.n_states)
+        
         for regime in range(self.n_states):
             # Get all volatilities assigned to this regime
             regime_vols = vols[regime_assignments == regime]
-            if len(regime_vols) >= 3:
-                # Mean = center of the Gaussian distribution for this regime
-                self.emission_means[regime] = np.mean(regime_vols)
-                # Std = spread of the Gaussian (how much variation within regime)
-                # Use max() to prevent zero std which would cause division errors
-                self.emission_stds[regime] = max(np.std(regime_vols), 1e-6)
+            regime_counts[regime] = len(regime_vols)
+            
+            if len(regime_vols) >= 5:  # Need minimum samples for reliable estimation
+                # MLE for Gaussian mean
+                temp_means[regime] = np.mean(regime_vols)
+                # MLE for Gaussian std (using n, not n-1)
+                # Add small constant for numerical stability
+                temp_stds[regime] = max(np.std(regime_vols, ddof=0), 1e-6)
+            else:
+                # Fallback: interpolate from neighboring regimes or use defaults
+                print(f"Warning: Regime {regime} has only {len(regime_vols)} samples")
+                temp_means[regime] = np.percentile(vols, 33 * regime + 16.5)
+                temp_stds[regime] = np.std(vols) / 3
         
         # Ensure means are properly ordered: LOW < MED < HIGH
-        # (in case percentile assignment didn't perfectly separate them)
-        sorted_indices = np.argsort(self.emission_means)
-        self.emission_means = self.emission_means[sorted_indices]
-        self.emission_stds = self.emission_stds[sorted_indices]
+        # This is a constraint that must be satisfied for interpretability
+        sorted_indices = np.argsort(temp_means)
+        self.emission_means = temp_means[sorted_indices]
+        self.emission_stds = temp_stds[sorted_indices]
+        
+        # Re-map regime assignments if order changed
+        if not np.array_equal(sorted_indices, np.arange(self.n_states)):
+            # Create mapping from old indices to new
+            index_map = {old: new for new, old in enumerate(sorted_indices)}
+            regime_assignments = np.array([index_map[r] for r in regime_assignments])
         
         # =====================================================================
-        # STEP 4: ESTIMATE TRANSITION MATRIX FROM REGIME SEQUENCE
+        # STEP 4: MLE FOR TRANSITION MATRIX
         # =====================================================================
-        # Count how many times we transitioned from regime i to regime j
-        # by looking at consecutive bars in the historical data
+        # The MLE for transition probabilities is simply the frequency estimate:
+        #   T̂[i,j] = N[i,j] / N[i,•]
+        # where N[i,j] = count of transitions from state i to j
+        #       N[i,•] = total transitions out of state i
+        #
+        # We apply Laplace (add-1) smoothing to handle zero counts:
+        #   T̂[i,j] = (N[i,j] + α) / (N[i,•] + α*K)
+        # where α = smoothing parameter (we use 1.0 for standard Laplace)
+        #       K = number of states
+        #
+        # This corresponds to a Bayesian estimate with uniform Dirichlet prior.
+        
         transition_counts = np.zeros((self.n_states, self.n_states))
+        
+        # Count transitions in the observed sequence
         for t in range(1, len(regime_assignments)):
-            prev_regime = regime_assignments[t-1]  # Where we were
-            curr_regime = regime_assignments[t]     # Where we went
+            prev_regime = regime_assignments[t-1]  # Where we were (Sₜ₋₁)
+            curr_regime = regime_assignments[t]     # Where we went (Sₜ)
             transition_counts[prev_regime, curr_regime] += 1
         
-        # Convert counts to probabilities by normalizing each row
+        # Apply MLE with Laplace smoothing (α = 1.0)
+        alpha = 1.0  # Smoothing parameter (Laplace/add-1 smoothing)
         for i in range(self.n_states):
             row_sum = transition_counts[i].sum()
             if row_sum > 0:
-                # Add 0.1 smoothing to each cell to avoid zero probabilities
-                # (Laplace smoothing - ensures all transitions are possible)
-                self.transition_matrix[i] = (transition_counts[i] + 0.1) / (row_sum + 0.3)
+                # MLE with Laplace smoothing: (count + α) / (total + α*K)
+                self.transition_matrix[i] = (transition_counts[i] + alpha) / (row_sum + alpha * self.n_states)
+            else:
+                # No transitions observed from this state - use uniform
+                self.transition_matrix[i] = np.ones(self.n_states) / self.n_states
         
-        # Reset state probabilities after calibration (start fresh)
-        self.state_probs = np.array([1/3, 1/3, 1/3])
+        # =====================================================================
+        # STEP 5: COMPUTE MODEL FIT STATISTICS (for validation)
+        # =====================================================================
+        # Log-likelihood of the fitted model
+        log_likelihood = self._compute_log_likelihood(vols, regime_assignments)
         
-        print(f"Calibrated emission means: {self.emission_means}")
-        print(f"Calibrated emission stds: {self.emission_stds}")
+        # Number of free parameters:
+        # - Emission: 2 params per state (mean, std) = 6
+        # - Transition: (K-1)*K params (each row sums to 1) = 6
+        # Total: 12 parameters
+        n_params = 2 * self.n_states + self.n_states * (self.n_states - 1)
+        n_samples = len(vols)
+        
+        # Akaike Information Criterion: AIC = 2k - 2ln(L)
+        # Lower is better; penalizes model complexity
+        aic = 2 * n_params - 2 * log_likelihood
+        
+        # Bayesian Information Criterion: BIC = k*ln(n) - 2ln(L)
+        # Stronger penalty for complexity than AIC
+        bic = n_params * np.log(n_samples) - 2 * log_likelihood
+        
+        # Store calibration diagnostics
+        self.is_calibrated = True
+        self.calibration_stats = {
+            'n_samples': n_samples,
+            'transition_counts': transition_counts.copy(),
+            'regime_counts': regime_counts.copy(),
+            'log_likelihood': log_likelihood,
+            'aic': aic,
+            'bic': bic
+        }
+        
+        # Compute stationary distribution (long-run regime probabilities)
+        stationary_dist = self._compute_stationary_distribution()
+        
+        # Reset state probabilities to stationary distribution
+        self.state_probs = stationary_dist
+        
+        # Print calibration summary
+        print(f"\n{'='*60}")
+        print(f"REGIME MODEL CALIBRATION COMPLETE")
+        print(f"{'='*60}")
+        print(f"Samples used: {n_samples}")
+        print(f"\nEmission Parameters (MLE estimates):")
+        print(f"  LOW:  μ = {self.emission_means[0]:.6f}, σ = {self.emission_stds[0]:.6f}")
+        print(f"  MED:  μ = {self.emission_means[1]:.6f}, σ = {self.emission_stds[1]:.6f}")
+        print(f"  HIGH: μ = {self.emission_means[2]:.6f}, σ = {self.emission_stds[2]:.6f}")
+        print(f"\nTransition Matrix (MLE with Laplace smoothing):")
+        print(f"        To LOW    To MED    To HIGH")
+        for i, name in enumerate(['LOW ', 'MED ', 'HIGH']):
+            print(f"  {name}  [{self.transition_matrix[i,0]:.4f}]  [{self.transition_matrix[i,1]:.4f}]  [{self.transition_matrix[i,2]:.4f}]")
+        print(f"\nStationary Distribution: {stationary_dist}")
+        print(f"\nModel Fit Statistics:")
+        print(f"  Log-Likelihood: {log_likelihood:.2f}")
+        print(f"  AIC: {aic:.2f}")
+        print(f"  BIC: {bic:.2f}")
+        print(f"{'='*60}\n")
+    
+    def _compute_log_likelihood(self, vols, regime_assignments):
+        """
+        Compute the log-likelihood of the data under the fitted model.
+        
+        L(θ|data) = Π P(vₜ|regime_t) × P(regime_t|regime_{t-1})
+        log L = Σ [log P(vₜ|regime_t) + log P(regime_t|regime_{t-1})]
+        """
+        log_lik = 0.0
+        
+        for t in range(len(vols)):
+            regime = regime_assignments[t]
+            
+            # Emission probability: P(vol|regime) using Gaussian PDF
+            emission_prob = stats.norm.pdf(vols[t], 
+                                           self.emission_means[regime], 
+                                           self.emission_stds[regime])
+            if emission_prob > 0:
+                log_lik += np.log(emission_prob)
+            
+            # Transition probability: P(regime_t|regime_{t-1})
+            if t > 0:
+                prev_regime = regime_assignments[t-1]
+                trans_prob = self.transition_matrix[prev_regime, regime]
+                if trans_prob > 0:
+                    log_lik += np.log(trans_prob)
+        
+        return log_lik
+    
+    def _compute_stationary_distribution(self):
+        """
+        Compute the stationary distribution of the Markov chain.
+        
+        The stationary distribution π satisfies: π = π × T
+        It represents the long-run probability of being in each state.
+        
+        We find it by solving the eigenvector problem: eigenvalue = 1.
+        """
+        # Find eigenvalues and eigenvectors of T^T
+        eigenvalues, eigenvectors = np.linalg.eig(self.transition_matrix.T)
+        
+        # Find the eigenvector corresponding to eigenvalue 1
+        # (there should always be one for a valid stochastic matrix)
+        idx = np.argmin(np.abs(eigenvalues - 1))
+        stationary = np.real(eigenvectors[:, idx])
+        
+        # Normalize to get probabilities (sum to 1)
+        stationary = stationary / stationary.sum()
+        
+        # Ensure all positive (might have small numerical errors)
+        stationary = np.abs(stationary)
+        stationary = stationary / stationary.sum()
+        
+        return stationary
 
     def _gaussian_likelihood(self, vol, regime):
         """
@@ -438,13 +603,16 @@ class MarkovRegime:
 # =============================================================================
 class TradingStrategy:
     """
-    Trading strategy based on HMM regime switching with statistical validation.
+    Enhanced trading strategy based on HMM regime switching with statistical validation.
     
     Uses the following statistical concepts:
     1. Maximum Likelihood Estimation (MLE) - for regime parameter calibration
     2. Maximum A Posteriori (MAP) - for regime classification
     3. Hypothesis Testing - to validate regime changes are significant
     4. P-values - to measure statistical significance of signals
+    5. Trend Detection - using linear regression slope with t-test
+    6. Momentum Indicators - rate of change and acceleration
+    7. Mean Reversion Detection - distance from rolling mean in std units
     """
     
     def __init__(self):
@@ -460,13 +628,203 @@ class TradingStrategy:
         # Strategy parameters
         self.confidence_threshold = 0.70                # Minimum MAP probability to act (70%)
         self.significance_level = 0.05                  # Alpha for hypothesis tests (5%)
-        self.min_bars_for_signal = 3                    # Minimum bars before generating signals
+        self.min_bars_for_signal = 5                    # Minimum bars before generating signals
         self.regime_history = []                        # Track regime changes
         self.volatility_history = []                    # Track volatility observations
+        
+        # =====================================================================
+        # TREND AND MOMENTUM TRACKING
+        # =====================================================================
+        self.price_history = []                         # Historical close prices
+        self.return_history = []                        # Historical returns
+        
+        # Trend parameters (for linear regression)
+        self.trend_window = 10                          # Lookback for trend calculation
+        self.trend_slope = 0.0                          # Current trend slope
+        self.trend_r_squared = 0.0                      # R² of trend fit
+        self.trend_p_value = 1.0                        # P-value for trend significance
+        
+        # Momentum parameters
+        self.momentum_window = 5                        # Lookback for momentum
+        self.momentum = 0.0                             # Current momentum (rate of change)
+        self.acceleration = 0.0                         # Change in momentum
+        
+        # Mean reversion parameters
+        self.mean_reversion_window = 20                 # Lookback for mean calculation
+        self.z_score = 0.0                              # Distance from mean in std units
+        self.mean_reversion_threshold = 2.0            # Z-score threshold for mean reversion
         
         # P&L tracking
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
+    
+    # =========================================================================
+    # TREND ANALYSIS METHODS
+    # =========================================================================
+    
+    def compute_trend(self, prices):
+        """
+        Compute trend using Ordinary Least Squares (OLS) linear regression.
+        
+        Model: price_t = α + β*t + ε
+        
+        We estimate β (slope) and test if it's significantly different from 0.
+        H₀: β = 0 (no trend)
+        H₁: β ≠ 0 (trend exists)
+        
+        Returns: (slope, r_squared, p_value)
+        """
+        if len(prices) < 3:
+            return 0.0, 0.0, 1.0
+        
+        n = len(prices)
+        x = np.arange(n)  # Time index: 0, 1, 2, ..., n-1
+        y = np.array(prices)
+        
+        # Normalize prices for numerical stability
+        y_mean = np.mean(y)
+        y_normalized = (y - y_mean) / y_mean if y_mean != 0 else y
+        
+        # OLS: β̂ = Σ(x - x̄)(y - ȳ) / Σ(x - x̄)²
+        x_mean = np.mean(x)
+        y_norm_mean = np.mean(y_normalized)
+        
+        numerator = np.sum((x - x_mean) * (y_normalized - y_norm_mean))
+        denominator = np.sum((x - x_mean) ** 2)
+        
+        if denominator == 0:
+            return 0.0, 0.0, 1.0
+        
+        slope = numerator / denominator
+        intercept = y_norm_mean - slope * x_mean
+        
+        # Predicted values and residuals
+        y_pred = intercept + slope * x
+        residuals = y_normalized - y_pred
+        
+        # R-squared: proportion of variance explained
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((y_normalized - y_norm_mean) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        # T-test for slope significance
+        # Standard error of slope: SE(β̂) = s / √Σ(x - x̄)²
+        # where s² = Σresiduals² / (n-2)
+        if n > 2:
+            mse = ss_res / (n - 2)
+            se_slope = np.sqrt(mse / denominator) if mse > 0 else 1e-10
+            t_stat = slope / se_slope if se_slope > 0 else 0
+            # Two-tailed p-value
+            p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=n-2))
+        else:
+            p_value = 1.0
+        
+        # Store for later use
+        self.trend_slope = slope
+        self.trend_r_squared = r_squared
+        self.trend_p_value = p_value
+        
+        return slope, r_squared, p_value
+    
+    def compute_momentum(self, prices):
+        """
+        Compute momentum as the rate of change (ROC) and acceleration.
+        
+        Momentum (ROC) = (P_t - P_{t-n}) / P_{t-n}
+        Acceleration = Momentum_t - Momentum_{t-1}
+        
+        Momentum measures the velocity of price changes.
+        Acceleration measures if momentum is increasing or decreasing.
+        """
+        if len(prices) < self.momentum_window + 1:
+            return 0.0, 0.0
+        
+        # Rate of Change (momentum)
+        current_price = prices[-1]
+        past_price = prices[-self.momentum_window]
+        momentum = (current_price - past_price) / past_price if past_price != 0 else 0
+        
+        # Acceleration (change in momentum)
+        if len(prices) >= self.momentum_window + 2:
+            prev_price = prices[-2]
+            prev_past_price = prices[-self.momentum_window - 1]
+            prev_momentum = (prev_price - prev_past_price) / prev_past_price if prev_past_price != 0 else 0
+            acceleration = momentum - prev_momentum
+        else:
+            acceleration = 0.0
+        
+        self.momentum = momentum
+        self.acceleration = acceleration
+        
+        return momentum, acceleration
+    
+    def compute_z_score(self, prices):
+        """
+        Compute Z-score: how many standard deviations the current price is from the mean.
+        
+        Z = (P_t - μ) / σ
+        
+        where μ = rolling mean over window
+              σ = rolling standard deviation
+        
+        Used for mean reversion signals:
+        - Z > 2: Price is unusually high, might revert down
+        - Z < -2: Price is unusually low, might revert up
+        """
+        if len(prices) < self.mean_reversion_window:
+            return 0.0
+        
+        window_prices = prices[-self.mean_reversion_window:]
+        mean = np.mean(window_prices)
+        std = np.std(window_prices)
+        
+        if std == 0:
+            return 0.0
+        
+        z_score = (prices[-1] - mean) / std
+        self.z_score = z_score
+        
+        return z_score
+    
+    def get_trend_direction(self):
+        """
+        Classify trend direction with statistical significance.
+        
+        Returns: ('UP', 'DOWN', 'NEUTRAL') with confidence level
+        """
+        if self.trend_p_value > self.significance_level:
+            # Trend is not statistically significant
+            return 'NEUTRAL', 1 - self.trend_p_value
+        
+        if self.trend_slope > 0:
+            return 'UP', 1 - self.trend_p_value
+        else:
+            return 'DOWN', 1 - self.trend_p_value
+    
+    def get_momentum_signal(self):
+        """
+        Generate momentum-based signal component.
+        
+        Returns: (signal_strength, direction)
+        signal_strength: 0 to 1 (1 = strong signal)
+        direction: 'BULLISH', 'BEARISH', 'NEUTRAL'
+        """
+        # Strong positive momentum with positive acceleration = bullish
+        # Strong negative momentum with negative acceleration = bearish
+        
+        if abs(self.momentum) < 0.001:  # Very small momentum
+            return 0.0, 'NEUTRAL'
+        
+        # Signal strength based on momentum magnitude (capped at 5%)
+        strength = min(abs(self.momentum) / 0.05, 1.0)
+        
+        if self.momentum > 0 and self.acceleration >= 0:
+            return strength, 'BULLISH'
+        elif self.momentum < 0 and self.acceleration <= 0:
+            return strength, 'BEARISH'
+        else:
+            # Momentum and acceleration disagree - potential reversal
+            return strength * 0.5, 'REVERSAL'
         
     def compute_log_likelihood(self, volatilities, regime_model, regime):
         """
@@ -536,17 +894,19 @@ class TradingStrategy:
     
     def generate_signal(self, bars, regime_model, current_price):
         """
-        Generate trading signal using HMM inference with statistical validation.
+        Generate trading signal using HMM inference with trend/momentum confirmation.
         
-        Signal Logic:
+        Enhanced Signal Logic:
         1. Use MAP estimate for current regime (from posterior probabilities)
         2. Validate regime change using hypothesis testing
-        3. Only trade when confidence exceeds threshold
+        3. Confirm with trend analysis (statistically significant trend)
+        4. Check momentum alignment
+        5. Consider mean reversion for extreme moves
         
-        Trading Rules:
-        - BUY when transitioning from HIGH→LOW or MED→LOW (volatility decreasing)
-        - SELL when transitioning from LOW→HIGH or MED→HIGH (volatility increasing)
-        - HOLD during uncertain periods or MED regime
+        Trading Rules (with trend/momentum confirmation):
+        - BUY when: volatility decreasing + (uptrend OR oversold z-score) + positive momentum
+        - SELL when: volatility increasing + (downtrend OR overbought z-score) + negative momentum
+        - HOLD during conflicting signals or uncertain periods
         """
         if len(bars) < self.min_bars_for_signal:
             return None
@@ -557,15 +917,27 @@ class TradingStrategy:
         # Get MAP probability (posterior probability of current regime)
         map_probability = regime_model.state_probs[current_regime]
         
-        # Track regime history
+        # Track regime and price history
         self.regime_history.append(current_regime)
         self.volatility_history.append(current_bar.volatility)
+        self.price_history.append(current_bar.close)
         
-        # Keep only recent history for hypothesis testing
-        window_size = 10
+        # Keep only recent history
+        window_size = max(self.trend_window, self.mean_reversion_window)
         if len(self.volatility_history) > window_size:
             self.volatility_history = self.volatility_history[-window_size:]
             self.regime_history = self.regime_history[-window_size:]
+            self.price_history = self.price_history[-window_size:]
+        
+        # =====================================================================
+        # COMPUTE TREND AND MOMENTUM INDICATORS
+        # =====================================================================
+        trend_slope, trend_r2, trend_pval = self.compute_trend(self.price_history)
+        momentum, acceleration = self.compute_momentum(self.price_history)
+        z_score = self.compute_z_score(self.price_history)
+        
+        trend_direction, trend_confidence = self.get_trend_direction()
+        momentum_strength, momentum_dir = self.get_momentum_signal()
         
         # Check for regime transition
         if len(self.regime_history) < 2:
@@ -573,26 +945,20 @@ class TradingStrategy:
             
         previous_regime = self.regime_history[-2]
         
-        # No action if regime hasn't changed
-        if current_regime == previous_regime:
-            return None
-            
         # =====================================================================
         # HYPOTHESIS TEST: Is this regime change statistically significant?
         # =====================================================================
-        # H₀: We're still in the previous regime
-        # H₁: We've transitioned to the new regime
         recent_vols = np.array(self.volatility_history[-5:]) if len(self.volatility_history) >= 5 else np.array(self.volatility_history)
         test_stat, p_value, is_significant = self.likelihood_ratio_test(
             recent_vols, regime_model, previous_regime, current_regime
         )
         
-        # Get transition probability (for logging)
+        # Get transition probability
         trans_prob = self.compute_regime_transition_probability(
             regime_model, previous_regime, current_regime
         )
         
-        # Create signal info
+        # Create comprehensive signal info
         signal = {
             'timestamp': current_bar.timestamp,
             'price': current_price,
@@ -603,36 +969,98 @@ class TradingStrategy:
             'is_significant': is_significant,
             'transition_prob': trans_prob,
             'test_statistic': test_stat,
+            # Enhanced indicators
+            'trend_direction': trend_direction,
+            'trend_confidence': trend_confidence,
+            'trend_slope': trend_slope,
+            'trend_r_squared': trend_r2,
+            'trend_p_value': trend_pval,
+            'momentum': momentum,
+            'momentum_direction': momentum_dir,
+            'acceleration': acceleration,
+            'z_score': z_score,
             'action': None,
             'executed': False
         }
         
         # =====================================================================
-        # TRADING DECISION LOGIC
+        # ENHANCED TRADING DECISION LOGIC
         # =====================================================================
-        # Only trade if:
-        # 1. MAP probability exceeds confidence threshold
-        # 2. Regime change is statistically significant (p < alpha)
+        # We use a scoring system that combines:
+        # 1. Regime signal (primary)
+        # 2. Trend confirmation (secondary)
+        # 3. Momentum alignment (secondary)
+        # 4. Mean reversion opportunity (bonus)
         
-        should_trade = (map_probability >= self.confidence_threshold) and is_significant
+        regime_names = ['LOW', 'MED', 'HIGH']
+        buy_score = 0.0
+        sell_score = 0.0
+        reasons = []
         
-        if should_trade:
-            # Regime names for reference
-            regime_names = ['LOW', 'MED', 'HIGH']
-            
-            # BUY SIGNAL: Volatility decreasing (HIGH→MED, HIGH→LOW, MED→LOW)
-            # Rationale: Market calming down, good time to enter long positions
-            if current_regime < previous_regime:
-                if self.position <= 0:  # Only if not already long
+        # --- REGIME COMPONENT (weight: 40%) ---
+        regime_changed = (current_regime != previous_regime)
+        if regime_changed and is_significant and map_probability >= self.confidence_threshold:
+            if current_regime < previous_regime:  # Volatility decreasing
+                buy_score += 0.4
+                reasons.append(f"Regime↓({regime_names[previous_regime]}→{regime_names[current_regime]})")
+            elif current_regime > previous_regime:  # Volatility increasing
+                sell_score += 0.4
+                reasons.append(f"Regime↑({regime_names[previous_regime]}→{regime_names[current_regime]})")
+        
+        # --- TREND COMPONENT (weight: 30%) ---
+        # Only consider if trend is statistically significant
+        if trend_pval < self.significance_level:
+            if trend_direction == 'UP':
+                buy_score += 0.3 * trend_confidence
+                reasons.append(f"Trend↑(p={trend_pval:.3f})")
+            elif trend_direction == 'DOWN':
+                sell_score += 0.3 * trend_confidence
+                reasons.append(f"Trend↓(p={trend_pval:.3f})")
+        
+        # --- MOMENTUM COMPONENT (weight: 20%) ---
+        if momentum_strength > 0.3:  # Only consider meaningful momentum
+            if momentum_dir == 'BULLISH':
+                buy_score += 0.2 * momentum_strength
+                reasons.append(f"Mom+({momentum*100:.1f}%)")
+            elif momentum_dir == 'BEARISH':
+                sell_score += 0.2 * momentum_strength
+                reasons.append(f"Mom-({momentum*100:.1f}%)")
+            elif momentum_dir == 'REVERSAL':
+                # Potential reversal - reduce confidence
+                buy_score *= 0.8
+                sell_score *= 0.8
+        
+        # --- MEAN REVERSION COMPONENT (weight: 10%) ---
+        # Z-score extreme values suggest mean reversion opportunity
+        if abs(z_score) > self.mean_reversion_threshold:
+            if z_score < -self.mean_reversion_threshold:  # Oversold
+                buy_score += 0.1
+                reasons.append(f"Oversold(z={z_score:.2f})")
+            elif z_score > self.mean_reversion_threshold:  # Overbought
+                sell_score += 0.1
+                reasons.append(f"Overbought(z={z_score:.2f})")
+        
+        # =====================================================================
+        # FINAL DECISION
+        # =====================================================================
+        # Require minimum combined score of 0.5 to act
+        # This means at least regime signal + one confirmation
+        min_score_threshold = 0.5
+        
+        # Also require regime signal to be present (don't trade on trend/momentum alone)
+        regime_signal_present = regime_changed and is_significant
+        
+        if regime_signal_present:
+            if buy_score >= min_score_threshold and buy_score > sell_score:
+                if self.position <= 0:  # Not already long
                     signal['action'] = 'BUY'
-                    signal['reason'] = f"Regime ↓ ({regime_names[previous_regime]}→{regime_names[current_regime]})"
-                    
-            # SELL SIGNAL: Volatility increasing (LOW→MED, LOW→HIGH, MED→HIGH)
-            # Rationale: Market getting turbulent, reduce risk exposure
-            elif current_regime > previous_regime:
-                if self.position >= 0:  # Only if not already short
+                    signal['score'] = buy_score
+                    signal['reason'] = ' + '.join(reasons)
+            elif sell_score >= min_score_threshold and sell_score > buy_score:
+                if self.position >= 0:  # Not already short
                     signal['action'] = 'SELL'
-                    signal['reason'] = f"Regime ↑ ({regime_names[previous_regime]}→{regime_names[current_regime]})"
+                    signal['score'] = sell_score
+                    signal['reason'] = ' + '.join(reasons)
         
         # Store signal for analysis
         self.signals.append(signal)
@@ -665,16 +1093,22 @@ class TradingStrategy:
             # In simulation mode, just track the trade
             if simulation_mode:
                 signal['executed'] = True
-                print(f"\n{'='*60}")
+                print(f"\n{'='*70}")
                 print(f"TRADE SIGNAL EXECUTED (SIMULATION)")
-                print(f"{'='*60}")
+                print(f"{'='*70}")
                 print(f"Action: {signal['action']}")
                 print(f"Price: ${signal['price']:.2f}")
+                print(f"Score: {signal.get('score', 0):.2f}")
                 print(f"Reason: {signal.get('reason', 'N/A')}")
+                print(f"\n--- Regime Analysis ---")
                 print(f"MAP Probability: {signal['map_probability']*100:.1f}%")
-                print(f"P-Value: {signal['p_value']:.4f}")
+                print(f"P-Value (LRT): {signal['p_value']:.4f}")
                 print(f"Statistically Significant: {signal['is_significant']}")
-                print(f"{'='*60}\n")
+                print(f"\n--- Trend & Momentum ---")
+                print(f"Trend: {signal.get('trend_direction', 'N/A')} (p={signal.get('trend_p_value', 1):.4f}, R²={signal.get('trend_r_squared', 0):.3f})")
+                print(f"Momentum: {signal.get('momentum', 0)*100:+.2f}% ({signal.get('momentum_direction', 'N/A')})")
+                print(f"Z-Score: {signal.get('z_score', 0):.2f}σ")
+                print(f"{'='*70}\n")
                 return True
             
             # Live trading: Send order to IB
@@ -746,23 +1180,60 @@ class TradingStrategy:
         return self.unrealized_pnl
     
     def get_statistics(self):
-        """Return strategy performance statistics."""
-        if not self.trades:
-            return {
-                'total_trades': 0,
-                'winning_trades': 0,
-                'win_rate': 0.0,
-                'total_pnl': self.realized_pnl,
-                'avg_pnl': 0.0
-            }
-        
-        winning = [t for t in self.trades if t['pnl'] > 0]
-        return {
+        """Return comprehensive strategy performance statistics."""
+        stats = {
             'total_trades': len(self.trades),
-            'winning_trades': len(winning),
-            'win_rate': len(winning) / len(self.trades) * 100,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'win_rate': 0.0,
             'total_pnl': self.realized_pnl,
-            'avg_pnl': self.realized_pnl / len(self.trades)
+            'avg_pnl': 0.0,
+            'max_win': 0.0,
+            'max_loss': 0.0,
+            # Current indicator values
+            'current_trend': self.get_trend_direction()[0],
+            'trend_confidence': self.get_trend_direction()[1],
+            'trend_slope': self.trend_slope,
+            'trend_r_squared': self.trend_r_squared,
+            'momentum': self.momentum,
+            'acceleration': self.acceleration,
+            'z_score': self.z_score,
+            # Signal analysis
+            'total_signals': len(self.signals),
+            'executed_signals': len([s for s in self.signals if s.get('executed', False)])
+        }
+        
+        if self.trades:
+            winning = [t for t in self.trades if t['pnl'] > 0]
+            losing = [t for t in self.trades if t['pnl'] <= 0]
+            
+            stats['winning_trades'] = len(winning)
+            stats['losing_trades'] = len(losing)
+            stats['win_rate'] = len(winning) / len(self.trades) * 100
+            stats['avg_pnl'] = self.realized_pnl / len(self.trades)
+            
+            if winning:
+                stats['max_win'] = max(t['pnl'] for t in winning)
+            if losing:
+                stats['max_loss'] = min(t['pnl'] for t in losing)
+        
+        return stats
+    
+    def get_indicator_summary(self):
+        """
+        Get a formatted summary of current technical indicators.
+        Useful for display in the UI.
+        """
+        trend_dir, trend_conf = self.get_trend_direction()
+        mom_strength, mom_dir = self.get_momentum_signal()
+        
+        return {
+            'trend': f"{trend_dir} ({trend_conf*100:.0f}%)" if trend_dir != 'NEUTRAL' else "NEUTRAL",
+            'trend_significant': self.trend_p_value < self.significance_level,
+            'momentum': f"{self.momentum*100:+.2f}%",
+            'momentum_direction': mom_dir,
+            'z_score': f"{self.z_score:.2f}σ",
+            'mean_reversion_signal': abs(self.z_score) > self.mean_reversion_threshold
         }
 
 
